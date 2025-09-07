@@ -694,19 +694,79 @@ class StripeChargeProcessor
 
     stripe_loan_paydown_id = data["id"]
     amount_cents = -data["details"]["total_amount"].to_i
+
+    # Enhanced duplicate check using ProcessedStripeEvent
+    event_key = "loan_paydown_#{stripe_loan_paydown_id}"
+    return if ProcessedStripeEvent.already_processed?(event_key)
+
+    # Legacy duplicate check for backward compatibility
     return if merchant_account.user.credits.where("json_data->'$.stripe_loan_paydown_id' = ?", stripe_loan_paydown_id).exists?
 
-    if data["details"]["reason"] == "collection"
-      Credit.create_for_manual_paydown_on_stripe_loan!(amount_cents:, merchant_account:, stripe_loan_paydown_id:)
-    elsif data["details"]["reason"] == "automatic_withholding"
-      linked_payment_id = data["details"]["transaction"]["charge"].presence || data["details"]["linked_payment"]
-      if linked_payment_id.present?
+    paydown_reason = data["details"]["reason"]
+    paydown_status = data["details"]["status"]
+
+    case paydown_reason
+    when "collection"
+      handle_manual_loan_paydown(amount_cents, merchant_account, stripe_loan_paydown_id, paydown_status)
+    when "automatic_withholding"
+      handle_automatic_loan_paydown(data, amount_cents, merchant_account, stripe_loan_paydown_id)
+    else
+      Rails.logger.warn("Unknown loan paydown reason: #{paydown_reason} for event #{stripe_event['id']}")
+    end
+
+    # Mark event as processed
+    ProcessedStripeEvent.mark_processed!(
+      event_key,
+      "capital.financing.paydown",
+      stripe_account_id: merchant_account.charge_processor_merchant_id,
+      metadata: {
+        stripe_loan_paydown_id: stripe_loan_paydown_id,
+        amount_cents: amount_cents,
+        reason: paydown_reason,
+        status: paydown_status
+      }
+    )
+  end
+
+  def self.handle_manual_loan_paydown(amount_cents, merchant_account, stripe_loan_paydown_id, status)
+    case status
+    when "succeeded"
+      # Only create credit if paydown was successful and funds were actually debited
+      Credit.create_for_manual_paydown_on_stripe_loan!(
+        amount_cents: amount_cents,
+        merchant_account: merchant_account,
+        stripe_loan_paydown_id: stripe_loan_paydown_id
+      )
+      Rails.logger.info("Created manual loan paydown credit for #{amount_cents} cents on account #{merchant_account.id}")
+    when "failed", "canceled"
+      # Don't create credit for failed paydowns
+      Rails.logger.info("Skipping credit creation for failed/canceled loan paydown #{stripe_loan_paydown_id}")
+    else
+      Rails.logger.warn("Unknown loan paydown status: #{status} for paydown #{stripe_loan_paydown_id}")
+    end
+  end
+
+  def self.handle_automatic_loan_paydown(data, amount_cents, merchant_account, stripe_loan_paydown_id)
+    linked_payment_id = data["details"]["transaction"]["charge"].presence || data["details"]["linked_payment"]
+    purchase = nil
+
+    if linked_payment_id.present?
+      begin
         linked_payment = Stripe::Charge.retrieve(linked_payment_id, { stripe_account: merchant_account.charge_processor_merchant_id })
         linked_transfer = Stripe::Transfer.retrieve(linked_payment.source_transfer)
         purchase = merchant_account.user.sales.find_by(stripe_transaction_id: linked_transfer.source_transaction)
+      rescue Stripe::StripeError => e
+        Rails.logger.error("Error retrieving linked payment for loan paydown #{stripe_loan_paydown_id}: #{e.message}")
       end
-      Credit.create_for_financing_paydown!(purchase:, amount_cents:, merchant_account:, stripe_loan_paydown_id:)
     end
+
+    Credit.create_for_financing_paydown!(
+      purchase: purchase,
+      amount_cents: amount_cents,
+      merchant_account: merchant_account,
+      stripe_loan_paydown_id: stripe_loan_paydown_id
+    )
+    Rails.logger.info("Created automatic loan paydown credit for #{amount_cents} cents on account #{merchant_account.id}")
   end
 
   def self.handle_stripe_charge_event(stripe_event)

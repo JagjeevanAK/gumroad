@@ -9,6 +9,7 @@ class Balance < ApplicationRecord
   belongs_to :merchant_account, optional: true
 
   has_many :balance_transactions
+  has_many :balance_audit_logs
 
   has_many :successful_sales, class_name: "Purchase", foreign_key: :purchase_success_balance_id
   has_many :chargedback_sales, class_name: "Purchase", foreign_key: :purchase_chargeback_balance_id
@@ -62,6 +63,26 @@ class Balance < ApplicationRecord
   end
 
   enum :state, %w[unpaid processing paid forfeited].index_by(&:itself), default: "unpaid"
+
+  def increment_with_audit!(field, amount, triggered_by:, source: nil, metadata: {})
+    amount_before = send(field)
+    holding_amount_before = holding_amount_cents
+
+    increment(field, amount)
+    save!
+
+    BalanceAuditLog.log_balance_change!(
+      balance: self,
+      operation: amount > 0 ? 'increment' : 'decrement',
+      amount_cents_before: amount_cents_was,
+      amount_cents_after: amount_cents,
+      holding_amount_cents_before: holding_amount_cents_was,
+      holding_amount_cents_after: holding_amount_cents,
+      triggered_by: triggered_by,
+      source: source,
+      metadata: metadata
+    )
+  end
 
   private
     def validate_amounts_are_only_changed_when_unpaid

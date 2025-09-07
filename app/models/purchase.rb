@@ -98,6 +98,7 @@ class Purchase < ApplicationRecord
   has_one :utm_link, through: :utm_link_driven_sale
 
   has_many :balance_transactions
+  has_one :balance_increment_record
   belongs_to :purchase_success_balance, class_name: "Balance", optional: true
   belongs_to :purchase_chargeback_balance, class_name: "Balance", optional: true
   belongs_to :purchase_refund_balance, class_name: "Balance", optional: true
@@ -1338,32 +1339,50 @@ class Purchase < ApplicationRecord
 
   def increment_sellers_balance!
     return if price_cents == 0
+    return if balance_already_incremented?
 
-    increment_affiliates_balance!
+    # Create idempotency record first
+    increment_record = BalanceIncrementRecord.create_for_purchase!(self)
 
-    return unless charged_using_gumroad_merchant_account?
+    ActiveRecord::Base.transaction do
+      increment_affiliates_balance!
 
-    seller_issued_amount = BalanceTransaction::Amount.create_issued_amount_for_seller(
-      flow_of_funds:,
-      issued_net_cents: payment_cents - affiliate_credit_cents
-    )
+      return unless charged_using_gumroad_merchant_account?
 
-    seller_holding_amount = BalanceTransaction::Amount.create_holding_amount_for_seller(
-      flow_of_funds:,
-      issued_net_cents: payment_cents - affiliate_credit_cents
-    )
+      seller_issued_amount = BalanceTransaction::Amount.create_issued_amount_for_seller(
+        flow_of_funds:,
+        issued_net_cents: payment_cents - affiliate_credit_cents
+      )
 
-    seller_balance_transaction = BalanceTransaction.create!(
-      user: seller,
-      merchant_account:,
-      purchase: self,
-      issued_amount: seller_issued_amount,
-      holding_amount: seller_holding_amount,
-      update_user_balance: charged_using_gumroad_merchant_account?
-    )
+      seller_holding_amount = BalanceTransaction::Amount.create_holding_amount_for_seller(
+        flow_of_funds:,
+        issued_net_cents: payment_cents - affiliate_credit_cents
+      )
 
-    self.purchase_success_balance = seller_balance_transaction.balance
-    save!
+      seller_balance_transaction = BalanceTransaction.create!(
+        user: seller,
+        merchant_account:,
+        purchase: self,
+        issued_amount: seller_issued_amount,
+        holding_amount: seller_holding_amount,
+        update_user_balance: charged_using_gumroad_merchant_account?
+      )
+
+      self.purchase_success_balance = seller_balance_transaction.balance
+      save!
+
+      # Mark idempotency record as completed
+      increment_record.mark_completed!(seller_balance_transaction)
+    end
+  rescue ActiveRecord::RecordNotUnique
+    # Balance already incremented by another process
+    Rails.logger.info("Purchase #{id}: Balance increment skipped - already processed")
+  end
+
+  private
+
+  def balance_already_incremented?
+    balance_increment_record.present?
   end
 
   def notify_seller!

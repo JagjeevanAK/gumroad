@@ -21,24 +21,45 @@ class StripeEventHandler
       return
     end
 
+    # Check if event already processed
+    stripe_event_id = params[:id]
+    if ProcessedStripeEvent.already_processed?(stripe_event_id)
+      Rails.logger.info("Stripe event #{stripe_event_id} already processed, skipping")
+      return
+    end
+
     stripe_connect_account_id = params[:user_id].present? ? params[:user_id] : params[:account]
 
-    if stripe_connect_account_id.present? && stripe_connect_account_id != STRIPE_PLATFORM_ACCOUNT_ID
-      if params && params[:type] == "account.application.deauthorized"
-        handle_event_for_connected_account_deauthorized
-      else
-        with_stripe_error_handler do
-          handle_event_for_connected_account(stripe_connect_account_id:)
+    begin
+      if stripe_connect_account_id.present? && stripe_connect_account_id != STRIPE_PLATFORM_ACCOUNT_ID
+        if params && params[:type] == "account.application.deauthorized"
+          handle_event_for_connected_account_deauthorized
+        else
+          with_stripe_error_handler do
+            handle_event_for_connected_account(stripe_connect_account_id:)
+          end
         end
+      else
+        handle_event_for_gumroad
       end
-    else
-      handle_event_for_gumroad
-    end
-  rescue StandardError => e
-    if Rails.env.staging?
-      Rails.logger.error("Error while handling event with params #{params} :: #{e}")
-    else
-      raise e
+
+      # Mark event as processed
+      ProcessedStripeEvent.mark_processed!(
+        stripe_event_id,
+        params[:type],
+        stripe_account_id: stripe_connect_account_id,
+        metadata: {
+          processed_at: Time.current,
+          handler_version: "enhanced_v1"
+        }
+      )
+    rescue StandardError => e
+      Rails.logger.error("Error processing Stripe event #{stripe_event_id}: #{e.message}")
+      if Rails.env.staging?
+        Rails.logger.error("Error while handling event with params #{params} :: #{e}")
+      else
+        raise e
+      end
     end
   end
 

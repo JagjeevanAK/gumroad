@@ -131,9 +131,31 @@ class BalanceTransaction < ApplicationRecord
   def update_balance!
     balance = find_or_create_balance
     balance.with_lock do
+      # Store original amounts for audit logging
+      amount_before = balance.amount_cents
+      holding_amount_before = balance.holding_amount_cents
+
       balance.increment(:amount_cents, issued_amount_net_cents)
       balance.increment(:holding_amount_cents, holding_amount_net_cents)
       balance.save!
+
+      # Create audit log
+      BalanceAuditLog.log_balance_change!(
+        balance: balance,
+        operation: issued_amount_net_cents >= 0 ? 'increment' : 'decrement',
+        amount_cents_before: amount_before,
+        amount_cents_after: balance.amount_cents,
+        holding_amount_cents_before: holding_amount_before,
+        holding_amount_cents_after: balance.holding_amount_cents,
+        triggered_by: "BalanceTransaction##{id}",
+        source: self,
+        metadata: {
+          issued_amount_net_cents: issued_amount_net_cents,
+          holding_amount_net_cents: holding_amount_net_cents,
+          currency: issued_amount_currency
+        }
+      )
+
       self.balance = balance
       save!
     end

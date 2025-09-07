@@ -247,6 +247,39 @@ class Credit < ApplicationRecord
     credit
   end
 
+  def self.create_for_dispute_win!(dispute:, merchant_account:, amount_cents:, currency:)
+    credit = new
+    credit.user = dispute.seller
+    credit.amount_cents = amount_cents
+    credit.merchant_account = merchant_account
+    credit.save!
+
+    balance_transaction_amount = BalanceTransaction::Amount.new(
+      currency: Currency::USD,
+      gross_cents: credit.get_usd_cents(merchant_account.currency, amount_cents),
+      net_cents: credit.get_usd_cents(merchant_account.currency, amount_cents)
+    )
+
+    balance_transaction_holding_amount = BalanceTransaction::Amount.new(
+      currency: merchant_account.currency,
+      gross_cents: amount_cents,
+      net_cents: amount_cents
+    )
+
+    balance_transaction = BalanceTransaction.create!(
+      user: credit.user,
+      merchant_account: credit.merchant_account,
+      dispute: dispute,
+      credit: credit,
+      issued_amount: balance_transaction_amount,
+      holding_amount: balance_transaction_holding_amount
+    )
+
+    credit.balance = balance_transaction.balance
+    credit.save!
+    credit
+  end
+
   def self.create_for_balance_change_on_stripe_account!(amount_cents_holding_currency:, merchant_account:, amount_cents_usd: nil)
     credit = new
     credit.user = merchant_account.user
